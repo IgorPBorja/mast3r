@@ -61,6 +61,24 @@ def get_args_parser():
     parser.prog = 'mast3r demo'
     return parser
 
+def _convert_scene_output_to_ply(outfile, imgs, pts3d, mask, focals, cams2world, silent=False):
+    assert len(pts3d) == len(mask) <= len(imgs) <= len(cams2world) == len(focals)
+    pts3d = to_numpy(pts3d)
+    imgs = to_numpy(imgs)
+    focals = to_numpy(focals)
+    cams2world = to_numpy(cams2world)
+
+    # full pointcloud
+    pts = np.concatenate([p[m.ravel()] for p, m in zip(pts3d, mask)]).reshape(-1, 3)
+    col = np.concatenate([p[m] for p, m in zip(imgs, mask)]).reshape(-1, 3)
+    valid_msk = np.isfinite(pts.sum(axis=1))
+    pct = trimesh.PointCloud(pts[valid_msk], colors=col[valid_msk])
+    rot = np.eye(4)
+    rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
+    pct.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
+    if not silent:
+        print('(exporting 3D point cloud (.ply) to', outfile, ')')
+    pct.export(file_obj=outfile)
 
 def _convert_scene_output_to_glb(outfile, imgs, pts3d, mask, focals, cams2world, cam_size=0.05,
                                  cam_color=None, as_pointcloud=False,
@@ -108,17 +126,14 @@ def _convert_scene_output_to_glb(outfile, imgs, pts3d, mask, focals, cams2world,
     return outfile
 
 
-def get_3D_model_from_scene(silent, scene_state, min_conf_thr=2, as_pointcloud=False, mask_sky=False,
-                            clean_depth=False, transparent_cams=False, cam_size=0.05, TSDF_thresh=0):
+def get_3D_model_from_scene(
+    silent, scene_state, min_conf_thr=2, as_pointcloud=False, mask_sky=False,
+    clean_depth=False, transparent_cams=False, cam_size=0.05, TSDF_thresh=0,
+    outfile: str | None = None
+):
     """
     extract 3D_model (glb file) from a reconstructed scene
     """
-    if scene_state is None:
-        return None
-    outfile = scene_state.outfile_name
-    if outfile is None:
-        return None
-
     # get optimized values from scene
     scene = scene_state.sparse_ga
     rgbimg = scene.imgs
@@ -132,14 +147,25 @@ def get_3D_model_from_scene(silent, scene_state, min_conf_thr=2, as_pointcloud=F
     else:
         pts3d, _, confs = to_numpy(scene.get_dense_pts3d(clean_depth=clean_depth))
     msk = to_numpy([c > min_conf_thr for c in confs])
-    return _convert_scene_output_to_glb(outfile, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=as_pointcloud,
-                                        transparent_cams=transparent_cams, cam_size=cam_size, silent=silent)
+
+    if outfile:
+        # save to file
+        if outfile.endswith(".ply"):
+            _convert_scene_output_to_ply(outfile, rgbimg, pts3d, msk, focals, cams2world, silent=silent)
+        else:
+            _convert_scene_output_to_glb(outfile, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=False,
+                                                transparent_cams=transparent_cams, cam_size=cam_size, silent=silent)
+
+    # return gradio temp file
+    if scene_state is not None and scene_state.outfile_name is not None:
+        return _convert_scene_output_to_glb(scene_state.outfile_name, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=as_pointcloud,
+                                            transparent_cams=transparent_cams, cam_size=cam_size, silent=silent)
 
 
 def get_reconstructed_scene(outdir, gradio_delete_cache, model, device, silent, image_size, current_scene_state,
                             filelist, optim_level, lr1, niter1, lr2, niter2, min_conf_thr, matching_conf_thr,
                             as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size, scenegraph_type, winsize,
-                            win_cyclic, refid, TSDF_thresh, shared_intrinsics, **kw):
+                            win_cyclic, refid, TSDF_thresh, shared_intrinsics, outfile: str | None = None, **kw):
     """
     from a list of images, run mast3r inference, sparse global aligner.
     then run get_3D_model_from_scene
@@ -184,7 +210,7 @@ def get_reconstructed_scene(outdir, gradio_delete_cache, model, device, silent, 
 
     scene_state = SparseGAState(scene, gradio_delete_cache, cache_dir, outfile_name)
     outfile = get_3D_model_from_scene(silent, scene_state, min_conf_thr, as_pointcloud, mask_sky,
-                                      clean_depth, transparent_cams, cam_size, TSDF_thresh)
+                                      clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile=outfile)
     return scene_state, outfile
 
 
@@ -237,6 +263,7 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
         gradio.HTML('<h2 style="text-align: center;">MASt3R Demo</h2>')
         with gradio.Column():
             inputfiles = gradio.File(file_count="multiple")
+            outfile = gradio.Text(label="Output Filename", value=None)
             with gradio.Row():
                 with gradio.Column():
                     with gradio.Row():
@@ -298,34 +325,34 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             run_btn.click(fn=recon_fun,
                           inputs=[scene, inputfiles, optim_level, lr1, niter1, lr2, niter2, min_conf_thr, matching_conf_thr,
                                   as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
-                                  scenegraph_type, winsize, win_cyclic, refid, TSDF_thresh, shared_intrinsics],
+                                  scenegraph_type, winsize, win_cyclic, refid, TSDF_thresh, shared_intrinsics, outfile],
                           outputs=[scene, outmodel])
             min_conf_thr.release(fn=model_from_scene_fun,
                                  inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size, TSDF_thresh],
+                                         clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile],
                                  outputs=outmodel)
             cam_size.change(fn=model_from_scene_fun,
                             inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size, TSDF_thresh],
+                                    clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile],
                             outputs=outmodel)
             TSDF_thresh.change(fn=model_from_scene_fun,
                                inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                       clean_depth, transparent_cams, cam_size, TSDF_thresh],
+                                       clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile],
                                outputs=outmodel)
             as_pointcloud.change(fn=model_from_scene_fun,
                                  inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size, TSDF_thresh],
+                                         clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile],
                                  outputs=outmodel)
             mask_sky.change(fn=model_from_scene_fun,
                             inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size, TSDF_thresh],
+                                    clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile],
                             outputs=outmodel)
             clean_depth.change(fn=model_from_scene_fun,
                                inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                       clean_depth, transparent_cams, cam_size, TSDF_thresh],
+                                       clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile],
                                outputs=outmodel)
             transparent_cams.change(model_from_scene_fun,
                                     inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                            clean_depth, transparent_cams, cam_size, TSDF_thresh],
+                                            clean_depth, transparent_cams, cam_size, TSDF_thresh, outfile],
                                     outputs=outmodel)
     demo.launch(share=share, server_name=server_name, server_port=server_port)
